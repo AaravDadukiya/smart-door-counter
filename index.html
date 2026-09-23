@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Smart Door Counter - Reliable</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#fff;font-family:Arial,sans-serif}
+header{padding:12px;text-align:center;background:#151b23}h2{margin:0;font-size:20px}
+#stage{position:relative;width:100%;max-width:900px;margin:auto;background:#000;overflow:hidden}
+video{display:block;width:100%;height:auto;object-fit:contain;background:#000}
+canvas{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none}
+.panel{max-width:900px;margin:auto;padding:10px;background:#151b23}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.stat{text-align:center;background:#232b35;border-radius:9px;padding:8px}.num{font-size:22px;font-weight:bold}
+.green{color:#45e07c}.red{color:#ff6975}.blue{color:#57b8ff}.yellow{color:#ffd166}
+button{width:100%;padding:12px;margin-top:8px;border:0;border-radius:9px;background:#2f3946;color:#fff;font-weight:bold}
+.row{display:flex;gap:8px;margin-top:8px}.row button{margin:0}
+#status{text-align:center;color:#ffd166;font-size:13px;margin:9px 0}
+.help{font-size:12px;color:#b8c0ca;line-height:1.45}
+</style>
+</head>
+<body>
+<header><h2>🚪 Smart Door IN / OUT Counter</h2></header>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+<div class="panel">
+  <div class="stats">
+    <div class="stat">IN<div id="in" class="num green">0</div></div>
+    <div class="stat">OUT<div id="out" class="num red">0</div></div>
+    <div class="stat">INSIDE<div id="inside" class="num blue">0</div></div>
+    <div class="stat">PEOPLE<div id="people" class="num yellow">0</div></div>
+  </div>
+  <button id="start">📷 START CAMERA & DETECTION</button>
+  <div class="row">
+    <button id="reset">↺ RESET</button>
+    <button id="csv">⬇ EXPORT CSV</button>
+  </div>
+  <div id="status">Press START CAMERA.</div>
+  <div class="help">
+    First wait for “AI READY”. You should then see a green box around a person and
+    “People detected: 1” (or more). Drag the red counting line with your finger.
+    A person crossing from the upper side to the lower side is IN; lower to upper is OUT.
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<script>
+const video=document.getElementById('video'), canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+let model=null, stream=null, running=false, linePct=.50;
+let tracks=new Map(), nextId=1, inCount=0, outCount=0, events=[];
+let detecting=false, lastFrame=0, fps=0;
+
+function resizeCanvas(){
+  if(video.videoWidth && video.videoHeight){
+    canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+  }
+}
+function setStatus(s){document.getElementById('status').textContent=s}
+function update(){
+ document.getElementById('in').textContent=inCount;
+ document.getElementById('out').textContent=outCount;
+ document.getElementById('inside').textContent=Math.max(0,inCount-outCount);
+ document.getElementById('people').textContent=tracks.size;
+}
+function side(y){return y < canvas.height*linePct ? -1:1}
+function distance(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function match(cx,cy){
+ let best=null,bestD=Infinity;
+ const maxD=Math.max(80,canvas.width*.18);
+ for(const [id,t] of tracks){
+   const d=distance({x:cx,y:cy},t);
+   if(d<bestD && d<maxD){bestD=d;best=id}
+ }
+ return best;
+}
+function drawLine(){
+ const y=canvas.height*linePct;
+ ctx.save();
+ ctx.strokeStyle="#ff3030";ctx.lineWidth=Math.max(5,canvas.width/170);
+ ctx.setLineDash([20,10]);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke();ctx.setLineDash([]);
+ ctx.fillStyle="#ff3030";ctx.font="bold "+Math.max(17,canvas.width/36)+"px Arial";
+ ctx.fillText("COUNTING LINE",12,Math.max(25,y-12));
+ ctx.fillStyle="#45e07c";ctx.fillText("↓ IN",canvas.width*.78,Math.max(28,y-14));
+ ctx.fillStyle="#ff6975";ctx.fillText("↑ OUT",canvas.width*.78,y+38);
+ ctx.restore();
+}
+function logEvent(type,id){
+ events.push({time:new Date().toLocaleString(),direction:type,id});
+}
+async function detectOnce(){
+ if(!model || video.readyState<2 || detecting) return;
+ detecting=true;
+ try{
+   const t0=performance.now();
+   const predictions=await model.detect(video,20,0.35);
+   const persons=predictions.filter(p=>p.class==="person" && p.score>=0.35);
+   const seen=new Set();
+
+   ctx.clearRect(0,0,canvas.width,canvas.height);
+
+   for(const p of persons){
+     const [x,y,w,h]=p.bbox;
+     // torso/center point is more stable than the exact bounding-box center
+     const cx=x+w/2, cy=y+h*0.58;
+     let id=match(cx,cy);
+
+     if(id===null){
+       id=nextId++;
+       tracks.set(id,{x:cx,y:cy,lastSide:side(cy),lastSeen:Date.now(),lastCross:0});
+     }else{
+       const t=tracks.get(id);
+       const newSide=side(cy);
+       if(t.lastSide!==newSide && Date.now()-t.lastCross>900){
+         if(t.lastSide===-1 && newSide===1){inCount++;logEvent("IN",id)}
+         else if(t.lastSide===1 && newSide===-1){outCount++;logEvent("OUT",id)}
+         t.lastCross=Date.now();
+       }
+       t.x=cx;t.y=cy;t.lastSide=newSide;t.lastSeen=Date.now();
+     }
+     seen.add(id);
+
+     ctx.strokeStyle="#00e676";ctx.lineWidth=4;ctx.strokeRect(x,y,w,h);
+     ctx.fillStyle="#00e676";ctx.font="bold 17px Arial";
+     ctx.fillText("PERSON "+id+"  "+Math.round(p.score*100)+"%",x,Math.max(20,y-7));
+     ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(cx,cy,5,0,Math.PI*2);ctx.fill();
+   }
+
+   const now=Date.now();
+   for(const [id,t] of tracks) if(now-t.lastSeen>2500) tracks.delete(id);
+
+   drawLine();update();
+   const ms=performance.now()-t0; fps=1000/Math.max(1,ms);
+   setStatus("AI READY • People detected: "+persons.length+" • Inference: "+Math.round(ms)+" ms");
+ }catch(e){
+   console.error(e);
+   setStatus("Detection error: "+e.message);
+ }finally{detecting=false}
+}
+function loop(){
+ if(!running)return;
+ const now=performance.now();
+ // Mobile-friendly: roughly 8-12 detections/sec instead of overloading the phone.
+ if(now-lastFrame>100) {lastFrame=now;detectOnce();}
+ requestAnimationFrame(loop);
+}
+
+async function start(){
+ try{
+   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+     throw new Error("Camera API is not available. Open the HTTPS GitHub Pages URL in Chrome.");
+   setStatus("Opening camera...");
+   stream=await navigator.mediaDevices.getUserMedia({
+     audio:false,
+     video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}}
+   });
+   video.srcObject=stream;
+   await video.play();
+   resizeCanvas();
+   setStatus("Camera ready. Loading AI model...");
+   // Explicitly select WebGL when available; fall back to CPU.
+   try{await tf.setBackend("webgl");await tf.ready()}catch(e){await tf.setBackend("cpu");await tf.ready()}
+   model=await cocoSsd.load({base:"mobilenet_v2"});
+   resizeCanvas();
+   running=true;setStatus("AI READY • Looking for people...");
+   loop();
+ }catch(e){
+   console.error(e);
+   setStatus("START ERROR: "+e.message);
+ }
+}
+
+document.getElementById("start").onclick=start;
+document.getElementById("reset").onclick=()=>{
+ inCount=0;outCount=0;events=[];tracks.clear();nextId=1;update();
+};
+document.getElementById("csv").onclick=()=>{
+ const rows=[["Time","Direction","Person ID"],...events.map(e=>[e.time,e.direction,e.id]),
+ ["TOTAL IN","",inCount],["TOTAL OUT","",outCount]];
+ const csv=rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(",")).join("\\n");
+ const a=document.createElement("a");
+ a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+ a.download="door-counter-"+new Date().toISOString().slice(0,10)+".csv";
+ a.click();
+};
+function linePointer(e){
+ const r=canvas.getBoundingClientRect();
+ linePct=Math.max(.08,Math.min(.92,(e.clientY-r.top)/r.height));
+}
+let dragging=false;
+canvas.addEventListener("pointerdown",e=>{
+ const r=canvas.getBoundingClientRect(), y=r.top+linePct*r.height;
+ if(Math.abs(e.clientY-y)<50){dragging=true;canvas.setPointerCapture(e.pointerId);e.preventDefault();}
+});
+canvas.addEventListener("pointermove",e=>{if(dragging){linePointer(e);e.preventDefault()}});
+canvas.addEventListener("pointerup",()=>dragging=false);
+canvas.addEventListener("pointercancel",()=>dragging=false);
+window.addEventListener("resize",resizeCanvas);
+</script>
+</body>
+</html>
