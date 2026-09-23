@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Smart Door Counter - Vertical Line + HUD</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#fff;font-family:Arial,sans-serif}
+header{padding:10px;text-align:center;background:#151b23}h2{margin:0;font-size:19px}
+#stage{position:relative;width:100%;max-width:900px;margin:auto;background:#000;overflow:hidden}
+video{display:block;width:100%;height:auto;min-height:55vh;object-fit:contain;background:#000}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+#hud{position:absolute;z-index:20;top:10px;left:10px;right:10px;pointer-events:none;
+display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:12px;
+background:rgba(0,0,0,.76);border:1px solid rgba(255,255,255,.3);backdrop-filter:blur(5px)}
+#hud .title{font-weight:800;font-size:13px}.box{padding:4px 7px;border-radius:7px;background:rgba(25,30,38,.9);font-size:13px;font-weight:700}
+.hin{color:#45e07c}.hout{color:#ff6975}.hinside{color:#57b8ff}
+#hudStatus{font-size:11px;color:#ffd166;max-width:48vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel{max-width:900px;margin:auto;padding:10px;background:#151b23}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.stat{text-align:center;background:#232b35;border-radius:9px;padding:8px}.num{font-size:21px;font-weight:bold}
+.green{color:#45e07c}.red{color:#ff6975}.blue{color:#57b8ff}.yellow{color:#ffd166}
+button{width:100%;padding:11px;margin-top:8px;border:0;border-radius:9px;background:#303a47;color:#fff;font-weight:bold}
+.row{display:flex;gap:7px}.row button{margin-top:8px}.help{font-size:12px;color:#b8c0ca;line-height:1.45;margin-top:8px}
+#status{text-align:center;color:#ffd166;font-size:13px;margin:8px 0}
+</style>
+</head>
+<body>
+<header><h2>🚪 Smart Door IN / OUT Counter</h2></header>
+
+<div id="stage">
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+
+<!-- Permanent on-screen overlay over the live camera -->
+<div id="hud">
+ <span class="title">🚪 DOOR</span>
+ <span class="box hin">IN <b id="hudIn">0</b></span>
+ <span class="box hout">OUT <b id="hudOut">0</b></span>
+ <span class="box hinside">INSIDE <b id="hudInside">0</b></span>
+ <span id="hudStatus">Press START</span>
+</div>
+</div>
+
+<div class="panel">
+<div class="stats">
+ <div class="stat">IN<div id="in" class="num green">0</div></div>
+ <div class="stat">OUT<div id="out" class="num red">0</div></div>
+ <div class="stat">INSIDE<div id="inside" class="num blue">0</div></div>
+ <div class="stat">PEOPLE<div id="people" class="num yellow">0</div></div>
+</div>
+<button id="start">📷 START CAMERA & DETECTION</button>
+<div class="row"><button id="reset">↺ RESET</button><button id="csv">⬇ EXPORT CSV</button></div>
+<div id="status">Press START CAMERA.</div>
+<div class="help"><b>Vertical reference line:</b> Drag the red vertical line left/right with your finger. <b>→ IN</b> means left-to-right crossing. <b>← OUT</b> means right-to-left crossing. The IN/OUT/INSIDE counter stays permanently on the camera screen.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<script>
+const video=document.getElementById('video'),canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
+let model=null,stream=null,running=false,linePct=.50,tracks=new Map(),nextId=1,inCount=0,outCount=0,events=[],busy=false,lastDetect=0;
+
+function resize(){if(video.videoWidth){canvas.width=video.videoWidth;canvas.height=video.videoHeight}}
+function setStatus(s){document.getElementById('status').textContent=s;document.getElementById('hudStatus').textContent=s}
+function update(){
+ const inside=Math.max(0,inCount-outCount);
+ document.getElementById('in').textContent=inCount;document.getElementById('out').textContent=outCount;
+ document.getElementById('inside').textContent=inside;document.getElementById('people').textContent=tracks.size;
+ document.getElementById('hudIn').textContent=inCount;document.getElementById('hudOut').textContent=outCount;document.getElementById('hudInside').textContent=inside;
+}
+function side(x){return x<canvas.width*linePct?-1:1}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function match(x,y){
+ let best=null,bd=Infinity,maxD=Math.max(90,canvas.width*.18);
+ for(const [id,t] of tracks){let d=dist({x,y},t);if(d<bd&&d<maxD){bd=d;best=id}}
+ return best;
+}
+function draw(){
+ const x=canvas.width*linePct;
+ ctx.save();ctx.strokeStyle='#ff3030';ctx.lineWidth=Math.max(5,canvas.width/170);ctx.setLineDash([20,10]);
+ ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke();ctx.setLineDash([]);
+ ctx.fillStyle='#ff3030';ctx.font='bold '+Math.max(16,canvas.width/38)+'px Arial';
+ ctx.fillText('COUNTING LINE',Math.min(canvas.width-190,Math.max(8,x+10)),28);
+ ctx.fillStyle='#45e07c';ctx.fillText('→ IN',Math.min(canvas.width-80,Math.max(8,x+10)),canvas.height*.45);
+ ctx.fillStyle='#ff6975';ctx.fillText('← OUT',Math.max(8,x-105),canvas.height*.55);ctx.restore();
+}
+function log(type,id){events.push({time:new Date().toLocaleString(),direction:type,id})}
+
+async function detect(){
+ if(!model||video.readyState<2||busy)return;busy=true;
+ try{
+  const pred=await model.detect(video,20,.35);
+  const people=pred.filter(p=>p.class==='person'&&p.score>=.35);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  for(const p of people){
+   const [x,y,w,h]=p.bbox,cx=x+w/2,cy=y+h*.58;let id=match(cx,cy);
+   if(id===null){id=nextId++;tracks.set(id,{x:cx,y:cy,lastSide:side(cx),lastSeen:Date.now(),lastCross:0})}
+   else{
+    const t=tracks.get(id),ns=side(cx);
+    if(t.lastSide!==ns&&Date.now()-t.lastCross>900){
+     if(t.lastSide===-1&&ns===1){inCount++;log('IN',id)}
+     else if(t.lastSide===1&&ns===-1){outCount++;log('OUT',id)}
+     t.lastCross=Date.now();
+    }
+    t.x=cx;t.y=cy;t.lastSide=ns;t.lastSeen=Date.now();
+   }
+   ctx.strokeStyle='#00e676';ctx.lineWidth=4;ctx.strokeRect(x,y,w,h);
+   ctx.fillStyle='#00e676';ctx.font='bold 16px Arial';ctx.fillText('PERSON '+id+' '+Math.round(p.score*100)+'%',x,Math.max(18,y-6));
+   ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(cx,cy,5,0,Math.PI*2);ctx.fill();
+  }
+  const now=Date.now();for(const [id,t] of tracks)if(now-t.lastSeen>2500)tracks.delete(id);
+  draw();update();setStatus('AI READY • People detected: '+people.length);
+ }catch(e){setStatus('Detection error: '+e.message)}finally{busy=false}
+}
+function loop(){if(!running)return;requestAnimationFrame(loop);const n=performance.now();if(n-lastDetect>110){lastDetect=n;detect()}}
+
+document.getElementById('start').onclick=async()=>{
+ try{
+  setStatus('Opening camera...');
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
+  video.srcObject=stream;await video.play();resize();setStatus('Camera ready • Loading AI...');
+  try{await tf.setBackend('webgl')}catch(e){await tf.setBackend('cpu')}await tf.ready();
+  model=await cocoSsd.load({base:'mobilenet_v2'});running=true;setStatus('AI READY • Looking for people...');loop();
+ }catch(e){setStatus('Camera/AI error: '+e.message)}
+};
+document.getElementById('reset').onclick=()=>{inCount=0;outCount=0;events=[];tracks.clear();nextId=1;update()};
+document.getElementById('csv').onclick=()=>{
+ const rows=[['Time','Direction','Person ID'],...events.map(e=>[e.time,e.direction,e.id]),['TOTAL IN','',inCount],['TOTAL OUT','',outCount]];
+ const csv=rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download='door-counter-'+new Date().toISOString().slice(0,10)+'.csv';a.click();
+};
+let dragging=false;
+canvas.addEventListener('pointerdown',e=>{
+ const r=canvas.getBoundingClientRect(),x=r.left+linePct*r.width;
+ if(Math.abs(e.clientX-x)<55){dragging=true;canvas.setPointerCapture(e.pointerId);e.preventDefault()}
+});
+canvas.addEventListener('pointermove',e=>{if(dragging){const r=canvas.getBoundingClientRect();linePct=Math.max(.08,Math.min(.92,(e.clientX-r.left)/r.width));e.preventDefault()}});
+canvas.addEventListener('pointerup',()=>dragging=false);canvas.addEventListener('pointercancel',()=>dragging=false);
+window.addEventListener('resize',resize);
+</script>
+</body>
+</html>
